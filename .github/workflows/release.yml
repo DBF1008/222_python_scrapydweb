@@ -1,0 +1,210 @@
+# Tag-driven release pipeline for ScrapydWeb.
+#
+# Trigger: pushing a tag like `v1.6.0`. (Also runnable manually via
+# workflow_dispatch, which defaults to a dry run that builds and verifies but
+# does not publish.)
+#
+# Each stage gates the next via `needs:`, so any failure stops the chain and
+# nothing is published:
+#
+#   verify-version -> build -> smoke-test -> publish-testpypi
+#                  -> verify-testpypi-install -> publish-pypi
+#
+# Credentials: OIDC Trusted Publishing (no stored secrets). A Trusted Publisher
+# must be registered once on BOTH TestPyPI and PyPI, bound to this repo, this
+# workflow filename (release.yml), and the `testpypi` / `pypi` environment names.
+# The `pypi` environment should require a reviewer -> that approval is the human
+# gate (and the rollback control) before anything reaches the real index.
+# See RELEASING.md for the full procedure and rollback matrix.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Existing tag to release, e.g. v1.6.0 (must match the package version)'
+        required: true
+      dry_run:
+        description: 'Build and verify only; skip publishing'
+        type: boolean
+        default: true
+
+# Never run two releases of the same ref concurrently; do not cancel an
+# in-flight publish.
+concurrency:
+  group: release-${{ github.event.inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Build/verify run on a current Python; the clean-install smoke runs on the
+  # lowest supported Python, where the 2021-era pinned deps install cleanly.
+  PYTHON_BUILD_VERSION: '3.11'
+  PYTHON_SMOKE_VERSION: '3.9'
+
+jobs:
+  # 1) Refuse to go further unless the tag and every place that records the
+  #    version (scrapydweb/__version__.py, setup.py, HISTORY.md, README badge)
+  #    agree.
+  verify-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_BUILD_VERSION }}
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.ref }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check version consistency
+        run: python -m release.check_version --tag "${{ steps.tag.outputs.tag }}"
+      - name: Export resolved version
+        id: ver
+        run: echo "version=$(python -c 'from release import read_version; print(read_version())')" >> "$GITHUB_OUTPUT"
+
+  # 2) Build sdist + wheel, run twine check, and verify the artifacts actually
+  #    contain the MANIFEST resources and carry the right version.
+  build:
+    needs: verify-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_BUILD_VERSION }}
+      - name: Install build tooling
+        run: python -m pip install --upgrade build twine
+      - name: Build sdist + wheel
+        run: python -m build
+      - name: twine check
+        run: python -m twine check dist/*
+      - name: Verify artifact contents and version
+        run: python -m release.verify_artifacts --expect-version "${{ needs.verify-version.outputs.version }}" --dist dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # 3) Install the built wheel AND sdist into clean venvs and smoke-test them
+  #    (import, version, console entry point, packaged data present).
+  #    setuptools<81 is pinned because APScheduler==3.6.0 imports pkg_resources,
+  #    which setuptools>=81 removed.
+  smoke-test:
+    needs: [verify-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_SMOKE_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Smoke-test the wheel in a clean venv
+        run: |
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/python -m pip install --upgrade pip "setuptools<81"
+          /tmp/wheel-venv/bin/python -m pip install dist/*.whl
+          cd /tmp && PYTHONPATH="$GITHUB_WORKSPACE" /tmp/wheel-venv/bin/python \
+            -m release.smoke_test --expect-version "${{ needs.verify-version.outputs.version }}"
+      - name: Smoke-test the sdist in a clean venv
+        run: |
+          python -m venv /tmp/sdist-venv
+          /tmp/sdist-venv/bin/python -m pip install --upgrade pip "setuptools<81"
+          /tmp/sdist-venv/bin/python -m pip install dist/*.tar.gz
+          cd /tmp && PYTHONPATH="$GITHUB_WORKSPACE" /tmp/sdist-venv/bin/python \
+            -m release.smoke_test --expect-version "${{ needs.verify-version.outputs.version }}"
+
+  # 4) Publish to TestPyPI first (OIDC). skip-existing makes re-runs idempotent.
+  publish-testpypi:
+    needs: [verify-version, build, smoke-test]
+    if: ${{ github.event_name == 'push' || github.event.inputs.dry_run == 'false' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/scrapydweb/${{ needs.verify-version.outputs.version }}/
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist
+          skip-existing: true
+
+  # 5) Install the just-published package FROM TestPyPI (deps resolved from the
+  #    real PyPI) and smoke-test it -- verifies what was actually uploaded.
+  verify-testpypi-install:
+    needs: [verify-version, publish-testpypi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_SMOKE_VERSION }}
+      - name: Install from TestPyPI and smoke-test
+        run: |
+          python -m venv /tmp/tp-venv
+          /tmp/tp-venv/bin/python -m pip install --upgrade pip "setuptools<81"
+          # TestPyPI can take a moment to serve a freshly uploaded release.
+          for i in 1 2 3 4 5 6; do
+            /tmp/tp-venv/bin/python -m pip install \
+              --index-url https://test.pypi.org/simple/ \
+              --extra-index-url https://pypi.org/simple/ \
+              "scrapydweb==${{ needs.verify-version.outputs.version }}" && break
+            echo "TestPyPI not ready yet, retrying in 15s..."; sleep 15
+          done
+          cd /tmp && PYTHONPATH="$GITHUB_WORKSPACE" /tmp/tp-venv/bin/python \
+            -m release.smoke_test --expect-version "${{ needs.verify-version.outputs.version }}"
+
+  # 6) Publish to PyPI. The `pypi` environment is configured with a required
+  #    reviewer, so this job waits for manual approval -- the last gate before
+  #    the immutable index.
+  publish-pypi:
+    needs: [verify-version, verify-testpypi-install]
+    if: ${{ github.event_name == 'push' || github.event.inputs.dry_run == 'false' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/scrapydweb/${{ needs.verify-version.outputs.version }}/
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
