@@ -7,6 +7,7 @@ from pprint import pformat
 import re
 from shutil import copyfile, copyfileobj, rmtree
 from subprocess import CalledProcessError
+import struct
 import tarfile
 import tempfile
 import time
@@ -33,6 +34,15 @@ project = projectname
 
 """
 folder_project_dict = {}
+
+
+def _has_surrogates(s):
+    """Return True if string contains characters that cannot be encoded as UTF-8 (surrogate code points)."""
+    try:
+        s.encode('utf-8')
+        return False
+    except UnicodeEncodeError:
+        return True
 
 
 class DeployView(BaseView):
@@ -225,7 +235,15 @@ class DeployUploadView(BaseView):
 
             if self.scrapy_cfg_not_found:
                 # Handle case when scrapy.cfg not found in zip file which contains illegal pathnames in PY3
-                message = "scrapy_cfg_searched_paths:\n%s" % pformat(self.scrapy_cfg_searched_paths)
+                # Sanitise paths that may contain surrogate characters before pformat.
+                safe_paths = []
+                for p in self.scrapy_cfg_searched_paths:
+                    try:
+                        p.encode('utf-8')
+                        safe_paths.append(p)
+                    except UnicodeEncodeError:
+                        safe_paths.append(p.encode('utf-8', 'replace').decode('ascii', 'replace'))
+                message = "scrapy_cfg_searched_paths:\n%s" % pformat(safe_paths)
             else:
                 message = "# The 'scrapy.cfg' file in your project directory should be like:\n%s" % SCRAPY_CFG
 
@@ -356,7 +374,15 @@ class DeployUploadView(BaseView):
         self.logger.debug("Uncompressing %s", filepath)
         tmpdir = tempfile.mkdtemp(prefix="scrapydweb-uncompress-")
         if zipfile.is_zipfile(filepath):
-            with zipfile.ZipFile(filepath, 'r') as f:
+            try:
+                zf = zipfile.ZipFile(filepath, 'r')
+            except UnicodeDecodeError:
+                # Python ≤3.10 strict-UTF-8 decoding of filenames with the
+                # UTF-8 flag set can fail on broken zip files.  Patch the raw
+                # bytes to clear the flag, then retry.
+                filepath = self._patch_zip_clear_utf8_flag(filepath)
+                zf = zipfile.ZipFile(filepath, 'r')
+            with zf as f:
                 if PY2:
                     tmpdir = tempfile.mkdtemp(prefix="scrapydweb-uncompress-")
                     for filename in f.namelist():
@@ -375,7 +401,52 @@ class DeployUploadView(BaseView):
                             # temp\\scrapydweb-uncompress-qrcyc0\\demo7/demo/'
                             mkdir_p(filepath_utf8)
                 else:
-                    f.extractall(tmpdir)
+                    # PY3: manual extraction with encoding fixup for Windows GBK/cp936 zips.
+                    # Python 3's zipfile decodes non-UTF-8-flagged entries as cp437,
+                    # but Windows Chinese zip tools encode filenames as GBK without the
+                    # UTF-8 flag (bit 11).  Re-encode to raw bytes and decode as GBK.
+                    tmpdir_norm = os.path.normpath(tmpdir)
+                    for zip_info in f.infolist():
+                        filename = zip_info.filename
+                        if not (zip_info.flag_bits & 0x800):
+                            # UTF-8 flag not set — Python decoded as cp437.
+                            # Try to recover the original bytes and decode as GBK.
+                            try:
+                                raw = filename.encode('cp437')
+                            except UnicodeEncodeError:
+                                raw = None
+                            if raw is not None:
+                                try:
+                                    filename = raw.decode('gbk')
+                                except (UnicodeDecodeError, UnicodeEncodeError):
+                                    try:
+                                        filename = raw.decode('utf-8')
+                                    except (UnicodeDecodeError, UnicodeEncodeError):
+                                        pass  # keep cp437-decoded name as last resort
+
+                        # Skip entries whose filename contains surrogate code points
+                        # (cannot be used as filesystem paths on POSIX).
+                        if _has_surrogates(filename):
+                            self.logger.warning(
+                                "Skipping zip entry with surrogate characters: %r",
+                                zip_info.filename)
+                            continue
+
+                        target = os.path.normpath(os.path.join(tmpdir, filename))
+                        # Prevent zip-slip: target must stay inside tmpdir
+                        if not (target == tmpdir_norm or target.startswith(tmpdir_norm + os.sep)):
+                            self.logger.warning(
+                                "Skipping zip entry with unsafe path: %r", filename)
+                            continue
+
+                        if zip_info.is_dir():
+                            os.makedirs(target, exist_ok=True)
+                        else:
+                            parent = os.path.dirname(target)
+                            if parent:
+                                os.makedirs(parent, exist_ok=True)
+                            with f.open(zip_info) as src_fh, open(target, 'wb') as dst_fh:
+                                copyfileobj(src_fh, dst_fh)
         else:  # tar.gz
             with tarfile.open(filepath, 'r') as tar:  # Open for reading with transparent compression (recommended).
                 tar.extractall(tmpdir)
@@ -389,23 +460,117 @@ class DeployUploadView(BaseView):
 
     def search_scrapy_cfg_path(self, search_path, func_walk=os.walk, retry=True):
         try:
+            candidates = []
             for dirpath, dirnames, filenames in func_walk(search_path):
+                # Skip directories whose path contains surrogate characters
+                # (e.g. from a broken zip extraction that wasn't fully sanitised).
+                if _has_surrogates(dirpath):
+                    continue
                 self.scrapy_cfg_searched_paths.append(os.path.abspath(dirpath))
-                self.scrapy_cfg_path = os.path.abspath(os.path.join(dirpath, 'scrapy.cfg'))
-                if os.path.exists(self.scrapy_cfg_path):
-                    self.logger.debug("scrapy_cfg_path: %s", self.scrapy_cfg_path)
-                    return
-        except UnicodeDecodeError:
+                if 'scrapy.cfg' in filenames:
+                    cfg_path = os.path.abspath(os.path.join(dirpath, 'scrapy.cfg'))
+                    candidates.append(cfg_path)
+            if candidates:
+                # Prefer the shallowest match (fewest path separators) so that
+                # the result is deterministic regardless of filesystem walk order.
+                self.scrapy_cfg_path = min(candidates, key=lambda p: p.count(os.sep))
+                self.logger.debug("scrapy_cfg_path: %s", self.scrapy_cfg_path)
+            else:
+                self.logger.error("scrapy.cfg not found in: %s", search_path)
+                self.scrapy_cfg_path = ''
+        except (UnicodeDecodeError, UnicodeEncodeError):
             msg = "Found illegal filenames in %s" % search_path
             self.logger.error(msg)
             flash(msg, self.WARN)
             if PY2 and retry:
                 self.search_scrapy_cfg_path(search_path, func_walk=self.safe_walk, retry=False)
+            elif retry:
+                self.search_scrapy_cfg_path(search_path, func_walk=self._safe_walk_py3, retry=False)
             else:
                 raise
-        else:
-            self.logger.error("scrapy.cfg not found in: %s", search_path)
-            self.scrapy_cfg_path = ''
+
+    def _safe_walk_py3(self, top, topdown=True, onerror=None, followlinks=False):
+        """Like os.walk but skips entries with surrogate / non-encodable names
+        and catches OSError per-directory so that a single broken entry does
+        not abort the whole walk."""
+        try:
+            entries = os.scandir(top)
+        except OSError as err:
+            if onerror is not None:
+                onerror(err)
+            return
+
+        dirs, nondirs = [], []
+        for entry in entries:
+            try:
+                name = entry.name
+                if _has_surrogates(name):
+                    msg = "Ignore non-encodable filename %s in %s" % (repr(name), top)
+                    self.logger.error(msg)
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    dirs.append(name)
+                else:
+                    nondirs.append(name)
+            except OSError:
+                continue
+
+        if topdown:
+            yield top, dirs, nondirs
+        for d in dirs:
+            new_path = os.path.join(top, d)
+            if followlinks or not os.path.islink(new_path):
+                yield from self._safe_walk_py3(new_path, topdown, onerror, followlinks)
+        if not topdown:
+            yield top, dirs, nondirs
+
+    @staticmethod
+    def _patch_zip_clear_utf8_flag(filepath):
+        """Read a zip file and return a patched copy with the UTF-8 flag (bit 11)
+        cleared from every local file header and central directory entry.
+
+        This allows Python ≤3.10 (which uses strict UTF-8 decoding for flagged
+        entries) to open zip files whose flagged filenames are not valid UTF-8.
+        After clearing the flag, Python will decode the filenames as cp437,
+        and our extraction loop will try GBK decoding instead.
+        """
+        with open(filepath, 'rb') as fh:
+            data = bytearray(fh.read())
+
+        # Local file header signature: PK\x03\x04
+        # Central directory header signature: PK\x01\x02
+        # In both, the general purpose bit flag is at offset 6 (2 bytes, little-endian)
+        pos = 0
+        while pos < len(data) - 4:
+            sig = data[pos:pos + 4]
+            if sig == b'PK\x03\x04':  # Local file header
+                flag_offset = pos + 6
+                flag = struct.unpack_from('<H', data, flag_offset)[0]
+                if flag & 0x800:
+                    struct.pack_into('<H', data, flag_offset, flag & ~0x800)
+                # Advance past this local header + filename + extra + data
+                fname_len = struct.unpack_from('<H', data, pos + 26)[0]
+                extra_len = struct.unpack_from('<H', data, pos + 28)[0]
+                comp_size = struct.unpack_from('<I', data, pos + 18)[0]
+                pos = pos + 30 + fname_len + extra_len + comp_size
+            elif sig == b'PK\x01\x02':  # Central directory entry
+                flag_offset = pos + 8
+                flag = struct.unpack_from('<H', data, flag_offset)[0]
+                if flag & 0x800:
+                    struct.pack_into('<H', data, flag_offset, flag & ~0x800)
+                fname_len = struct.unpack_from('<H', data, pos + 28)[0]
+                extra_len = struct.unpack_from('<H', data, pos + 30)[0]
+                comment_len = struct.unpack_from('<H', data, pos + 32)[0]
+                pos = pos + 46 + fname_len + extra_len + comment_len
+            elif sig == b'PK\x05\x06':  # End of central directory
+                break
+            else:
+                pos += 1
+
+        patched = tempfile.mktemp(suffix='.zip', prefix='scrapydweb-patched-')
+        with open(patched, 'wb') as fh:
+            fh.write(bytes(data))
+        return patched
 
     def build_egg(self):
         try:
