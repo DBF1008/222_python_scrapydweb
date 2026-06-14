@@ -76,7 +76,7 @@ pip install --upgrade git+https://github.com/my8100/scrapydweb.git
 ```bash
 git clone https://github.com/my8100/scrapydweb.git
 cd scrapydweb
-python setup.py install
+pip install .
 ```
 
 ### :arrow_forward: 启动
@@ -106,7 +106,7 @@ $ virtualenv venv/scrapydweb
 $ source venv/scrapydweb/bin/activate
 
 # 安装依赖库
-(scrapydweb) $ python setup.py install
+(scrapydweb) $ pip install .
 (scrapydweb) $ pip install pytest
 (scrapydweb) $ pip install coverage
 

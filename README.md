@@ -81,7 +81,7 @@ Or:
 ```bash
 git clone https://github.com/my8100/scrapydweb.git
 cd scrapydweb
-python setup.py install
+pip install .
 ```
 
 ### :arrow_forward: Start
@@ -111,7 +111,7 @@ $ virtualenv venv/scrapydweb
 $ source venv/scrapydweb/bin/activate
 
 # Install dependent libraries
-(scrapydweb) $ python setup.py install
+(scrapydweb) $ pip install .
 (scrapydweb) $ pip install pytest
 (scrapydweb) $ pip install coverage
 

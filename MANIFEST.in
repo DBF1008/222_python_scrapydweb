@@ -1,7 +1,18 @@
+# Governs the sdist file set (the wheel is driven by [tool.setuptools.package-data]).
+include pyproject.toml
+include README.md
+include README_CN.md
+include LICENSE
 include HISTORY.md
+
 include scrapydweb/data/parse/ScrapydWeb_demo.log
 include scrapydweb/data/demo_projects/ScrapydWeb_demo/scrapy.cfg
+
 graft scrapydweb/static
 graft scrapydweb/templates
+# Graft the canonical demo project; the "ScrapydWeb_demo - 副本" unicode test
+# fixture is not grafted here but still ships via setuptools' default .py sources.
 graft scrapydweb/data/demo_projects/ScrapydWeb_demo/ScrapydWeb_demo
+
 global-exclude *.pyc
+global-exclude __pycache__
