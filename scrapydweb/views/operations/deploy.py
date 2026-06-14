@@ -34,6 +34,98 @@ project = projectname
 """
 folder_project_dict = {}
 
+# Bit 11 of the ZIP general purpose bit flag: filename is UTF-8 encoded (EFS).
+ZIP_UTF8_FLAG = 0x800
+
+
+def normalize_pathname(name):
+    # Guarantee a surrogate-free, UTF-8 encodable str so that the path can be
+    # walked, joined, displayed (flash/template) and logged without raising
+    # UnicodeEncodeError later on. A lone surrogate (e.g. from os.walk reading
+    # an undecodable on-disk name) is replaced with '?'.
+    if PY2 or not isinstance(name, text_type):
+        return name
+    try:
+        name.encode('utf-8')
+    except UnicodeEncodeError:
+        name = name.encode('utf-8', 'replace').decode('utf-8')
+    return name
+
+
+def decode_zip_member_filename(filename, flag_bits):
+    # In PY3, zipfile decodes a member name as UTF-8 only when the EFS/UTF-8 flag
+    # (bit 11) is set; otherwise it falls back to cp437, which turns non-ASCII
+    # names (e.g. a zip packaged on Windows with cp936/gbk, or even on macOS
+    # which stores UTF-8 bytes without setting the flag) into mojibake. Recover
+    # the original bytes and try the common encodings so that Chinese / nested
+    # project directories keep usable names. Always return a surrogate-free path.
+    if PY2 or not isinstance(filename, text_type):
+        return filename
+    if not (flag_bits & ZIP_UTF8_FLAG):
+        try:
+            raw = filename.encode('cp437')  # reverse zipfile's cp437 fallback
+        except UnicodeEncodeError:
+            raw = filename.encode('utf-8', 'surrogateescape')
+        # Try UTF-8 first (macOS/Linux often omit the flag while storing UTF-8);
+        # gbk bytes are invalid UTF-8 and correctly fall through to gbk.
+        for encoding in ('utf-8', 'gbk'):
+            try:
+                filename = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+    return normalize_pathname(filename)
+
+
+def extract_zip_to_dir(zip_file, tmpdir):
+    # Extract a ZipFile member by member instead of using extractall() so that a
+    # single illegal/undecodable name cannot abort the whole archive, and so each
+    # name is recovered + normalized to a filesystem-safe path. Leading/parent
+    # path components are stripped to keep extraction confined to tmpdir (zip
+    # slip). Returns a list of (member_name, error) tuples for skipped members.
+    skipped = []
+    for zip_info in zip_file.infolist():
+        original = zip_info.filename
+        filename = decode_zip_member_filename(original, zip_info.flag_bits)
+        parts = [p for p in filename.replace('\\', '/').split('/')
+                 if p not in ('', os.curdir, os.pardir)]
+        if not parts:
+            continue
+        target = os.path.join(tmpdir, *parts)
+        is_dir = filename.endswith('/') or original.endswith('/')
+        if not is_dir:
+            try:
+                is_dir = zip_info.is_dir()  # ZipInfo.is_dir() is PY3.6+ only
+            except AttributeError:
+                pass
+        try:
+            if is_dir:
+                mkdir_p(target)
+            else:
+                # zipfile from Windows "send to compressed folder" may yield the
+                # inner file before its folder entry, so create parents on demand.
+                mkdir_p(os.path.dirname(target) or tmpdir)
+                with io.open(target, 'wb') as f_out:
+                    copyfileobj(zip_file.open(zip_info), f_out)
+        except (IOError, OSError) as err:
+            skipped.append((original, str(err)))
+    return skipped
+
+
+def walk_for_scrapy_cfg(search_path, walk=os.walk):
+    # Walk search_path top-down and return (scrapy_cfg_path, searched_paths) for
+    # the shallowest directory that contains a scrapy.cfg, so that a zip with a
+    # nested project directory still resolves to a valid project root. The
+    # searched paths are sanitized for safe display even if walk yields a name
+    # carrying surrogates.
+    searched_paths = []
+    for dirpath, dirnames, filenames in walk(search_path):
+        searched_paths.append(normalize_pathname(os.path.abspath(dirpath)))
+        scrapy_cfg_path = os.path.abspath(os.path.join(dirpath, 'scrapy.cfg'))
+        if os.path.exists(scrapy_cfg_path):
+            return scrapy_cfg_path, searched_paths
+    return '', searched_paths
+
 
 class DeployView(BaseView):
 
@@ -375,7 +467,16 @@ class DeployUploadView(BaseView):
                             # temp\\scrapydweb-uncompress-qrcyc0\\demo7/demo/'
                             mkdir_p(filepath_utf8)
                 else:
-                    f.extractall(tmpdir)
+                    # PY3: extractall() decodes a non-UTF-8 (e.g. Windows cp936)
+                    # member name with cp437, producing mojibake folder names,
+                    # and a member flagged UTF-8 but carrying invalid bytes could
+                    # even abort the whole archive. Extract member by member and
+                    # recover/normalize each name to a usable path instead.
+                    for (member_name, err) in extract_zip_to_dir(f, tmpdir):
+                        msg = "Skip illegal entry %s in %s: %s" % (
+                            repr(member_name), os.path.basename(filepath), err)
+                        self.logger.error(msg)
+                        flash(msg, self.WARN)
         else:  # tar.gz
             with tarfile.open(filepath, 'r') as tar:  # Open for reading with transparent compression (recommended).
                 tar.extractall(tmpdir)
@@ -389,23 +490,25 @@ class DeployUploadView(BaseView):
 
     def search_scrapy_cfg_path(self, search_path, func_walk=os.walk, retry=True):
         try:
-            for dirpath, dirnames, filenames in func_walk(search_path):
-                self.scrapy_cfg_searched_paths.append(os.path.abspath(dirpath))
-                self.scrapy_cfg_path = os.path.abspath(os.path.join(dirpath, 'scrapy.cfg'))
-                if os.path.exists(self.scrapy_cfg_path):
-                    self.logger.debug("scrapy_cfg_path: %s", self.scrapy_cfg_path)
-                    return
+            scrapy_cfg_path, searched_paths = walk_for_scrapy_cfg(search_path, walk=func_walk)
         except UnicodeDecodeError:
             msg = "Found illegal filenames in %s" % search_path
             self.logger.error(msg)
             flash(msg, self.WARN)
-            if PY2 and retry:
+            # In PY3, os.walk may also raise on undecodable on-disk names; retry
+            # with safe_walk (which skips them) so that a valid scrapy.cfg residing
+            # alongside the illegal names can still be located.
+            if retry:
                 self.search_scrapy_cfg_path(search_path, func_walk=self.safe_walk, retry=False)
             else:
                 raise
         else:
-            self.logger.error("scrapy.cfg not found in: %s", search_path)
-            self.scrapy_cfg_path = ''
+            self.scrapy_cfg_searched_paths.extend(searched_paths)
+            self.scrapy_cfg_path = scrapy_cfg_path
+            if scrapy_cfg_path:
+                self.logger.debug("scrapy_cfg_path: %s", scrapy_cfg_path)
+            else:
+                self.logger.error("scrapy.cfg not found in: %s", search_path)
 
     def build_egg(self):
         try:
