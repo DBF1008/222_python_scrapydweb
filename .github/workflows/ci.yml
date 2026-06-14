@@ -1,0 +1,217 @@
+# ──────────────────────────────────────────────────────────────────────
+# ScrapydWeb CI — GitHub Actions Workflow
+#
+# Matrix coverage:
+#   - 6 Python versions (3.8–3.13) × default settings
+#   - 2 Scrapyd version pins (v1.4.3 on py39, py312)
+#   - 2 Git HEAD installs (py310 + postgresql, py310 + mysql)
+#   - 3 Database backends on py310 (postgresql, mysql, sqlite-custom)
+#   - Coverage upload: py310-postgresql, py310-mysql, py312
+#   - Allure report: py312 only
+#
+# Reusable scripts live in scripts/ci/ and can also be run locally.
+# Matrix integrity is validated by scripts/ci/validate-matrix.py.
+# ──────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  SCRAPYDWEB_TESTMODE: 'True'
+
+# ──────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ── Lint (independent, fast-fail signal) ────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install flake8
+        run: pip install flake8
+      - name: Flake8 critical errors (must pass)
+        run: >-
+          flake8 . --count --exclude=./venv*,.git,./build,./dist
+          --select=E9,F63,F7,F82 --show-source --statistics
+      - name: Flake8 style check (non-blocking)
+        run: >-
+          flake8 . --count --exclude=./venv*,.git,./build,./dist
+          --max-line-length=120 --statistics
+          --ignore=E266,E303,E128,E701,W504
+        continue-on-error: true
+
+  # ── Matrix validation (ensures no missing combos) ───────────────────
+  validate-matrix:
+    name: Validate CI Matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pyyaml
+        run: pip install pyyaml
+      - name: Run matrix validation
+        run: python scripts/ci/validate-matrix.py
+
+  # ── Test matrix ─────────────────────────────────────────────────────
+  test:
+    name: >-
+      Test (py${{ matrix.python-version }},
+      ${{ matrix.scrapyd-variant }},
+      ${{ matrix.db-backend }})
+    needs: [lint, validate-matrix]
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Base cross-product: each Python version with default scrapyd + default db
+        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+        scrapyd-variant: [default]
+        db-backend: [default]
+        include:
+          # ── Scrapyd version pinning ──
+          - python-version: '3.9'
+            scrapyd-variant: v1.4.3
+            db-backend: default
+          - python-version: '3.12'
+            scrapyd-variant: v1.4.3
+            db-backend: default
+
+          # ── Git HEAD installs with DB backends ──
+          - python-version: '3.10'
+            scrapyd-variant: git
+            db-backend: postgresql
+          - python-version: '3.10'
+            scrapyd-variant: git
+            db-backend: mysql
+
+          # ── Database backends (Python 3.10) ──
+          - python-version: '3.10'
+            scrapyd-variant: default
+            db-backend: sqlite-custom
+          - python-version: '3.10'
+            scrapyd-variant: default
+            db-backend: postgresql
+            upload-coverage: true
+          - python-version: '3.10'
+            scrapyd-variant: default
+            db-backend: mysql
+            upload-coverage: true
+
+          # ── Coverage upload + Allure on latest stable Python ──
+          - python-version: '3.12'
+            scrapyd-variant: default
+            db-backend: default
+            upload-coverage: true
+            allure: true
+
+    # Service containers (started for all matrix entries; unused ones idle)
+    services:
+      postgres:
+        image: postgres:9.6
+        env:
+          POSTGRES_USER: circleci
+          POSTGRES_DB: circleci
+          POSTGRES_PASSWORD: passw0rd
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      mysql:
+        image: mysql:5.7
+        env:
+          MYSQL_ROOT_PASSWORD: rootpw
+          MYSQL_DATABASE: test_db
+          MYSQL_USER: user
+          MYSQL_PASSWORD: passw0rd
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Configure environment variables
+        run: bash scripts/ci/setup-env.sh
+        env:
+          DB_BACKEND: ${{ matrix.db-backend }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/install.sh
+        env:
+          SCRAPYD_VARIANT: ${{ matrix.scrapyd-variant }}
+
+      - name: Setup database
+        if: matrix.db-backend == 'postgresql' || matrix.db-backend == 'mysql'
+        run: bash scripts/ci/setup-db.sh
+        env:
+          DB_BACKEND: ${{ matrix.db-backend }}
+
+      - name: Launch Scrapyd
+        run: bash scripts/ci/launch-scrapyd.sh
+
+      - name: Run tests
+        run: bash scripts/ci/run-tests.sh
+        env:
+          ALLURE_ENABLED: ${{ matrix.allure || 'false' }}
+
+      - name: Generate coverage report
+        if: always()
+        run: bash scripts/ci/coverage-report.sh
+        env:
+          UPLOAD_COVERAGE: ${{ matrix.upload-coverage || 'false' }}
+          DB_BACKEND: ${{ matrix.db-backend }}
+          PYTHON_VERSION: ${{ matrix.python-version }}
+
+      - name: Upload coverage HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html-py${{ matrix.python-version }}-${{ matrix.db-backend }}-${{ matrix.scrapyd-variant }}
+          path: htmlcov/
+          retention-days: 7
+
+      - name: Upload JUnit test results
+        if: always() && !(matrix.allure)
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-py${{ matrix.python-version }}-${{ matrix.db-backend }}-${{ matrix.scrapyd-variant }}
+          path: test-results.xml
+          retention-days: 7
+
+      # ── Allure (only on py312 default) ──
+      - name: Generate Allure report
+        if: always() && matrix.allure
+        uses: simple-elf/allure-report-action@v1.9
+        with:
+          allure_results: allure-results
+          allure_report: allure-report
+
+      - name: Upload Allure report
+        if: always() && matrix.allure
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-report
+          path: allure-report
+          retention-days: 30
