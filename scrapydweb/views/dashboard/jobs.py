@@ -9,6 +9,7 @@ from six.moves.urllib.parse import urljoin
 
 from ...common import handle_metadata
 from ...models import create_jobs_table, db
+from ...utils.job_parser import parse_jobs
 from ...vars import STRICT_NAME_PATTERN, jobs_table_map
 from ..baseview import BaseView
 
@@ -27,22 +28,6 @@ STATUS_FINISHED = '2'
 NOT_DELETED = '0'
 DELETED = '1'
 HREF_PATTERN = re.compile(r"""href=['"](.+?)['"]""")  # Temp support for Scrapyd v1.3.0 (not released)
-# See also scrapydweb/utils/poll.py
-JOB_PATTERN = re.compile(r"""
-                            <tr>\s*
-                                <td>(?P<Project>.*?)</td>\s*
-                                <td>(?P<Spider>.*?)</td>\s*
-                                <td>(?P<Job>.*?)</td>\s*
-                                (?:<td>(?P<PID>.*?)</td>\s*)?
-                                (?:<td>(?P<Start>.*?)</td>\s*)?
-                                (?:<td>(?P<Runtime>.*?)</td>\s*)?
-                                (?:<td>(?P<Finish>.*?)</td>\s*)?
-                                (?:<td>(?P<Log>.*?)</td>\s*)?
-                                (?:<td>(?P<Items>.*?)</td>\s*)?
-                                [\w\W]*?  # Temp support for Scrapyd v1.3.0 (not released)
-                            </tr>
-                          """, re.X)
-JOB_KEYS = ['project', 'spider', 'job', 'pid', 'start', 'runtime', 'finish', 'href_log', 'href_items']
 
 
 class JobsView(BaseView):
@@ -106,9 +91,7 @@ class JobsView(BaseView):
                 tip="Click the above link to make sure your Scrapyd server is accessable. "
             )
             return render_template(self.template_fail, **kwargs)
-        # Temp support for Scrapyd v1.3.0 (not released)
-        self.text = re.sub(r'<thead>.*?</thead>', '', self.text, flags=re.S)
-        self.jobs = [dict(zip(JOB_KEYS, job)) for job in re.findall(JOB_PATTERN, self.text)]
+        self.jobs = parse_jobs(self.text)
         self.jobs_backup = list(self.jobs)
 
         if self.listjobs:

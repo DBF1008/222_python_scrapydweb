@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import platform
-import re
 import sys
 import time
 import traceback
@@ -16,6 +15,11 @@ except ImportError:
 import requests
 from requests.adapters import HTTPAdapter
 
+try:
+    from job_parser import parse_jobs  # When poll.py is run as a standalone script (see sub_process.start_poll)
+except ImportError:
+    from .job_parser import parse_jobs  # When imported as the scrapydweb.utils.poll module (e.g. by the tests)
+
 
 logger = logging.getLogger('scrapydweb.utils.poll')  # __name__
 _handler = logging.StreamHandler()
@@ -24,22 +28,6 @@ _handler.setFormatter(_formatter)
 logger.addHandler(_handler)
 
 IN_WINDOWS = platform.system() == 'Windows'
-# See also scrapydweb/views/dashboard/jobs.py
-JOB_PATTERN = re.compile(r"""
-                            <tr>\s*
-                                <td>(?P<Project>.*?)</td>\s*
-                                <td>(?P<Spider>.*?)</td>\s*
-                                <td>(?P<Job>.*?)</td>\s*
-                                (?:<td>(?P<PID>.*?)</td>\s*)?
-                                (?:<td>(?P<Start>.*?)</td>\s*)?
-                                (?:<td>(?P<Runtime>.*?)</td>\s*)?
-                                (?:<td>(?P<Finish>.*?)</td>\s*)?
-                                (?:<td>(?P<Log>.*?)</td>\s*)?
-                                (?:<td>(?P<Items>.*?)</td>\s*)?
-                                [\w\W]*?  # Temp support for Scrapyd v1.3.0 (not released)
-                            </tr>
-                          """, re.X)
-JOB_KEYS = ['project', 'spider', 'job', 'pid', 'start', 'runtime', 'finish', 'log', 'items']
 
 
 class Poll(object):
@@ -107,9 +95,7 @@ class Poll(object):
         assert r is not None, "[node %s] fetch_jobs failed: %s" % (node, url)
 
         self.logger.debug("[node %s] fetch_jobs got (%s) %s bytes", node, r.status_code, len(r.content))
-        # Temp support for Scrapyd v1.3.0 (not released)
-        text = re.sub(r'<thead>.*?</thead>', '', r.text, flags=re.S)
-        jobs = [dict(zip(JOB_KEYS, job)) for job in re.findall(JOB_PATTERN, text)]
+        jobs = parse_jobs(r.text)
         for job in jobs:
             job_tuple = (job['project'], job['spider'], job['job'])
             if job['pid']:
