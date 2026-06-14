@@ -1,6 +1,7 @@
 # coding: utf-8
 from collections import OrderedDict, defaultdict
 from datetime import date, datetime
+import gzip
 import io
 import json
 import os
@@ -13,6 +14,7 @@ import time
 from flask import flash, get_flashed_messages, render_template, request, url_for
 from logparser import parse
 
+from ...common import session
 from ...vars import ROOT_DIR
 from ..baseview import BaseView
 
@@ -225,8 +227,12 @@ class LogView(BaseView):
                 if tarfile.is_tarfile(log_path):
                     self.logger.debug("Ignore local tarfile and use requests instead: %s", log_path)
                     break
-                with io.open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    self.text = f.read()
+                if log_path.endswith('.gz'):
+                    with gzip.open(log_path, 'rt', encoding='utf-8', errors='ignore') as f:
+                        self.text = f.read()
+                else:
+                    with io.open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        self.text = f.read()
                 log_path = self.handle_slash(log_path)
                 msg = "Using local logfile: %s" % log_path
                 self.logger.debug(msg)
@@ -236,8 +242,32 @@ class LogView(BaseView):
     def request_scrapy_log(self):
         for ext in self.SCRAPYD_LOG_EXTENSIONS:
             url = self.url + ext
-            self.status_code, self.text = self.make_request(url, auth=self.AUTH, as_json=False)
-            if self.status_code == 200:
+            try:
+                if self.AUTH:
+                    r = session.get(url, auth=self.AUTH, timeout=60)
+                else:
+                    r = session.get(url, timeout=60)
+            except Exception as err:
+                self.logger.error("!!!!! error with %s: %s", url, err)
+                self.status_code = -1
+                self.text = str(err)
+                continue
+
+            self.status_code = r.status_code
+            if r.status_code == 200:
+                # Access r.content (raw bytes) for gzip handling, since make_request()
+                # returns r.text which applies UTF-8 decode with errors='replace' on
+                # raw gzip bytes, destroying the binary data before we can decompress it.
+                if url.endswith('.gz'):
+                    try:
+                        self.text = gzip.decompress(r.content).decode('utf-8', errors='ignore')
+                    except Exception:
+                        # Server may have already decompressed via Content-Encoding: gzip,
+                        # so r.content is plain text bytes; fall back to UTF-8 decode.
+                        self.text = r.content.decode('utf-8', errors='ignore')
+                else:
+                    r.encoding = 'utf-8'
+                    self.text = r.text
                 self.url = url
                 self.logger.debug("Got logfile from %s", self.url)
                 break

@@ -1,9 +1,11 @@
 # coding: utf-8
 from datetime import datetime
 from io import BytesIO
+import gzip
 import json
 import os
 import re
+from shutil import copy
 import time
 
 from flask import url_for
@@ -169,6 +171,76 @@ def test_demo_log_with_extension(app, client):
         ins = ['<tr><th>runtime</th><td>0:01:08</td></tr>', 'id="finish_reason">finished<']
         req(app, client, view='log', kws=kws, ins=ins,
             nos=['<h4>Log</h4>', url_utf8_, '<h4>Source</h4>', url_demo_json_source])
+
+
+# Regression: read_local_scrapy_log() must decompress .log.gz files
+# https://github.com/username/scrapydweb/issues/XXX
+def test_local_gzip_log(app, client):
+    """Test that local .log.gz files are correctly decompressed when reading logs.
+
+    Covers:
+    - Stats path: local gzip log -> parse() -> stats page
+    - Utf8 path: local gzip log -> raw text display
+    - with_ext=True: Logs page links pointing to .log.gz files
+    - Priority: .log is preferred over .log.gz when both exist
+    """
+    demo_log_path = app.config['DEMO_LOG_PATH']
+    spider_dir = os.path.dirname(demo_log_path)
+    gz_path = os.path.join(spider_dir, 'ScrapydWeb_demo.log.gz')
+
+    try:
+        # 1. Create a gzip-compressed copy of the demo log
+        with open(demo_log_path, 'rb') as f_in:
+            log_content = f_in.read()
+        with gzip.open(gz_path, 'wb') as f_out:
+            f_out.write(log_content)
+
+        # 2. Temporarily hide the plain .log so only .log.gz is found
+        hidden_log_path = demo_log_path + '.hidden'
+        os.rename(demo_log_path, hidden_log_path)
+
+        with app.test_request_context():
+            # --- Stats page via local gzip log (read_local_scrapy_log -> parse) ---
+            kws = dict(node=1, opt='stats', project=cst.PROJECT, spider=cst.SPIDER, job=cst.DEMO_JOBID)
+            ins = ['Log analysis', 'id="finish_reason">finished<',
+                   '<tr><th>runtime</th><td>0:01:08</td></tr>']
+            req(app, client, view='log', kws=kws, ins=ins)
+
+            # --- Utf8 page via local gzip log (read_local_scrapy_log -> raw text) ---
+            kws = dict(node=1, opt='utf8', project=cst.PROJECT, spider=cst.SPIDER, job=cst.DEMO_JOBID)
+            ins = ['log - ScrapydWeb', 'Scrapy 1.5.0 started', 'Spider closed (finished)']
+            req(app, client, view='log', kws=kws, ins=ins)
+
+            # --- with_ext=True for .log.gz file (Logs page link to gzip) ---
+            job_gz = cst.DEMO_LOG + '.gz'  # 'ScrapydWeb_demo.log.gz'
+            kws = dict(node=1, opt='stats', project=cst.PROJECT, spider=cst.SPIDER,
+                       job=job_gz, with_ext='True')
+            ins = ['Log analysis', 'id="finish_reason">finished<']
+            req(app, client, view='log', kws=kws, ins=ins)
+
+            kws = dict(node=1, opt='utf8', project=cst.PROJECT, spider=cst.SPIDER,
+                       job=job_gz, with_ext='True')
+            ins = ['log - ScrapydWeb', 'Scrapy 1.5.0 started']
+            req(app, client, view='log', kws=kws, ins=ins)
+
+        # 3. Restore plain .log and keep .log.gz: .log must win (priority order)
+        os.rename(hidden_log_path, demo_log_path)
+        hidden_log_path = None  # Mark as restored so finally block doesn't try again
+
+        with app.test_request_context():
+            kws = dict(node=1, opt='utf8', project=cst.PROJECT, spider=cst.SPIDER, job=cst.DEMO_JOBID)
+            # Should serve the .log file (not .log.gz), both yield same content
+            text, __ = req(app, client, view='log', kws=kws,
+                           ins=['log - ScrapydWeb', 'Scrapy 1.5.0 started'])
+            # Verify the flash message references the .log file (not .log.gz)
+            assert 'Using local logfile' in text
+            assert '.log.gz' not in text.split('Using local logfile')[1].split('<')[0]
+
+    finally:
+        if hidden_log_path and os.path.exists(hidden_log_path):
+            os.rename(hidden_log_path, demo_log_path)
+        if os.path.exists(gz_path):
+            os.remove(gz_path)
 
 
 # Location: http://127.0.0.1:5000/log/uploaded/ttt.txt
