@@ -1,7 +1,16 @@
+# Documentation
 include HISTORY.md
-include scrapydweb/data/parse/ScrapydWeb_demo.log
-include scrapydweb/data/demo_projects/ScrapydWeb_demo/scrapy.cfg
+include LICENSE
+include README.md
+
+# Static assets and templates
 graft scrapydweb/static
 graft scrapydweb/templates
-graft scrapydweb/data/demo_projects/ScrapydWeb_demo/ScrapydWeb_demo
+
+# Demo projects and sample data
+include scrapydweb/data/parse/ScrapydWeb_demo.log
+recursive-include scrapydweb/data/demo_projects *
+
+# Exclusions
 global-exclude *.pyc
+global-exclude __pycache__
