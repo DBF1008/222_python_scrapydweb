@@ -1,6 +1,7 @@
 # coding: utf-8
 from collections import OrderedDict, defaultdict
 from datetime import date, datetime
+import gzip
 import io
 import json
 import os
@@ -225,8 +226,21 @@ class LogView(BaseView):
                 if tarfile.is_tarfile(log_path):
                     self.logger.debug("Ignore local tarfile and use requests instead: %s", log_path)
                     break
-                with io.open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    self.text = f.read()
+                # A plain gzip-compressed logfile (e.g. '.log.gz') is NOT a tarfile, so it slips
+                # past the check above; reading it as utf-8 text would yield garbled or empty
+                # content. Detect it by the resolved log_path (covers with_ext=True, where ext='')
+                # and decompress instead. Fall back to requesting the log if decompression fails
+                # (e.g. a truncated/partial '.gz' that is still being written).
+                if log_path.endswith('.gz'):
+                    try:
+                        with gzip.open(log_path, 'rt', encoding='utf-8', errors='ignore') as f:
+                            self.text = f.read()
+                    except Exception as err:
+                        self.logger.error("Fail to read local gzip logfile %s: %s", log_path, err)
+                        break
+                else:
+                    with io.open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        self.text = f.read()
                 log_path = self.handle_slash(log_path)
                 msg = "Using local logfile: %s" % log_path
                 self.logger.debug(msg)

@@ -1,5 +1,7 @@
 # coding: utf-8
 from datetime import datetime
+import gzip
+import io
 from io import BytesIO
 import json
 import os
@@ -169,6 +171,66 @@ def test_demo_log_with_extension(app, client):
         ins = ['<tr><th>runtime</th><td>0:01:08</td></tr>', 'id="finish_reason">finished<']
         req(app, client, view='log', kws=kws, ins=ins,
             nos=['<h4>Log</h4>', url_utf8_, '<h4>Source</h4>', url_demo_json_source])
+
+
+# Regression test for reading local gzip-compressed logfiles (e.g. '.log.gz').
+# Before the fix, read_local_scrapy_log() opened a '.log.gz' as plain utf-8 text, so the
+# Log/Stats pages got garbled or empty content. Now it is decompressed via gzip.
+def test_local_gzip_log(app, client):
+    with app.test_request_context():
+        # The demo logfile was copied into LOCAL_SCRAPYD_LOGS_DIR by setup_env().
+        with io.open(app.config['DEMO_LOG_PATH'], 'r', encoding='utf-8') as f:
+            log_text = f.read()
+        spider_dir = os.path.dirname(app.config['DEMO_LOG_PATH'])
+        scrapyd_server = app.config['SCRAPYD_SERVERS'][0]
+        # A line that is rendered verbatim in the utf8 (raw log) page.
+        log_line = '2018-10-23 18:29:42 [scrapy.core.engine] INFO: Spider closed (finished)'
+
+        # A job whose ONLY local logfile is a gzip-compressed '.log.gz' (no plain '.log'),
+        # so read_local_scrapy_log() is forced down the gzip branch.
+        gzip_job = 'ScrapydWeb_demo_gzip'
+        gzip_log_path = os.path.join(spider_dir, gzip_job + '.log.gz')
+        with gzip.open(gzip_log_path, 'wt', encoding='utf-8') as f:
+            f.write(log_text)
+
+        # --- Stats path: the local '.log.gz' is decompressed and parsed by LogParser ---
+        kws = dict(node=1, opt='stats', project=cst.PROJECT, spider=cst.SPIDER, job=gzip_job)
+        ins = ['<tr><th>runtime</th><td>0:01:08</td></tr>', 'id="finish_reason">finished<']
+        req(app, client, view='log', kws=kws, ins=ins)
+
+        # --- Log path: the utf8 page shows the decompressed raw content, not gzip bytes ---
+        kws = dict(node=1, opt='utf8', project=cst.PROJECT, spider=cst.SPIDER, job=gzip_job)
+        req(app, client, view='log', kws=kws, ins=log_line)
+
+        # --- with_ext=True: links from the Logs page carry the full '.log.gz' filename ---
+        gzip_filename = gzip_job + '.log.gz'
+        url_source = 'http://%s/logs/%s/%s/%s' % (scrapyd_server, cst.PROJECT, cst.SPIDER, gzip_filename)
+        url_utf8 = url_for('log', node=1, opt='utf8', project=cst.PROJECT, spider=cst.SPIDER,
+                           job=gzip_filename, with_ext='True')
+        url_stats = url_for('log', node=1, opt='stats', project=cst.PROJECT, spider=cst.SPIDER,
+                            job=gzip_filename, with_ext='True')
+        # with_ext Stats page: SCRAPYD_LOG_EXTENSIONS becomes [''], so gzip is detected by log_path.
+        kws = dict(node=1, opt='stats', project=cst.PROJECT, spider=cst.SPIDER,
+                   job=gzip_filename, with_ext='True')
+        ins = ['<tr><th>runtime</th><td>0:01:08</td></tr>', 'id="finish_reason">finished<',
+               '<h4>Log</h4>', url_utf8, '<h4>Source</h4>', url_source]
+        req(app, client, view='log', kws=kws, ins=ins)
+        # with_ext Log (utf8) page
+        kws = dict(node=1, opt='utf8', project=cst.PROJECT, spider=cst.SPIDER,
+                   job=gzip_filename, with_ext='True')
+        ins = [log_line, '<h4>Stats</h4>', url_stats, '<h4>Source</h4>', url_source]
+        req(app, client, view='log', kws=kws, ins=ins)
+
+        # --- Precedence: when both '.log' and '.log.gz' exist, '.log' wins (extension order) ---
+        precedence_job = 'ScrapydWeb_demo_precedence'
+        marker_plain = 'PRECEDENCE_MARKER_PLAIN_LOG'
+        marker_gzip = 'PRECEDENCE_MARKER_GZIP_LOG'
+        with io.open(os.path.join(spider_dir, precedence_job + '.log'), 'w', encoding='utf-8') as f:
+            f.write('2018-10-23 18:28:34 [scrapy.utils.log] INFO: %s\n' % marker_plain)
+        with gzip.open(os.path.join(spider_dir, precedence_job + '.log.gz'), 'wt', encoding='utf-8') as f:
+            f.write('2018-10-23 18:28:34 [scrapy.utils.log] INFO: %s\n' % marker_gzip)
+        kws = dict(node=1, opt='utf8', project=cst.PROJECT, spider=cst.SPIDER, job=precedence_job)
+        req(app, client, view='log', kws=kws, ins=marker_plain, nos=marker_gzip)
 
 
 # Location: http://127.0.0.1:5000/log/uploaded/ttt.txt
