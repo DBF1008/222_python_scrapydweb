@@ -1,0 +1,144 @@
+name: Run ScrapydWeb tests
+description: >-
+  The single reusable entry point for every CI combination. Sets up Python,
+  installs dependencies, selects the Scrapyd variant, launches Scrapyd
+  (basic auth admin/12345 on 127.0.0.1:6800) and runs the test suite with
+  coverage against the chosen database backend.
+
+inputs:
+  python-version:
+    description: Python version to set up, e.g. "3.10".
+    required: true
+  scrapyd:
+    description: >-
+      Scrapyd variant: "pip" (latest, from requirements-tests.txt),
+      "v143" (scrapyd==1.4.3) or "git" (scrapy + scrapyd + logparser from git HEAD).
+    required: false
+    default: pip
+  database:
+    description: 'Database backend: sqlite, postgresql or mysql.'
+    required: false
+    default: sqlite
+  data-path:
+    description: Set to "true" to exercise a custom DATA_PATH (sqlite only).
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python ${{ inputs.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    # tests/utils.py:setup_env() exits if ~/logs is missing.
+    - name: Create ~/logs
+      shell: bash
+      run: mkdir -p "$HOME/logs"
+
+    - name: Resolve test environment
+      shell: bash
+      env:
+        SCRAPYD_DATABASE: ${{ inputs.database }}
+        SCRAPYD_DATA_PATH: ${{ inputs.data-path }}
+      run: |
+        set -euo pipefail
+        # The app creates its databases itself in test mode
+        # (scrapydweb/utils/setup_database.py), so CI only needs DATABASE_URL to
+        # point at a reachable server whose login can CREATE DATABASE.
+        echo "SCRAPYDWEB_TESTMODE=True" >> "$GITHUB_ENV"
+        case "$SCRAPYD_DATABASE" in
+          postgresql)
+            # Password is intentionally bogus; the service uses trust auth.
+            echo "DATABASE_URL=postgresql://circleci:fakepassword@localhost:5432" >> "$GITHUB_ENV"
+            ;;
+          mysql)
+            echo "DATABASE_URL=mysql://root:rootpw@127.0.0.1:3306" >> "$GITHUB_ENV"
+            ;;
+          sqlite)
+            if [ "$SCRAPYD_DATA_PATH" = "true" ]; then
+              echo "DATA_PATH=${GITHUB_WORKSPACE}/scrapydweb_data" >> "$GITHUB_ENV"
+              # 'sqlite:///' + an absolute path (GITHUB_WORKSPACE starts with '/')
+              # yields the 4-slash absolute form PATTERN_SQLITE expects.
+              echo "DATABASE_URL=sqlite:///${GITHUB_WORKSPACE}/scrapydweb_database" >> "$GITHUB_ENV"
+            fi
+            ;;
+          *)
+            echo "Unknown database backend: $SCRAPYD_DATABASE" >&2
+            exit 1
+            ;;
+        esac
+        echo "----- resolved CI environment -----"
+        cat "$GITHUB_ENV"
+
+    # psycopg2 (source, not -binary) is pinned in requirements-tests.txt.
+    - name: Install PostgreSQL build headers
+      if: ${{ inputs.database == 'postgresql' }}
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt -r requirements-tests.txt
+        python --version
+        pip list
+
+    - name: Install Scrapyd 1.4.3
+      if: ${{ inputs.scrapyd == 'v143' }}
+      shell: bash
+      run: pip install scrapyd==1.4.3
+
+    - name: Install Scrapy, Scrapyd and LogParser from git
+      if: ${{ inputs.scrapyd == 'git' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        pip install -U \
+          git+https://github.com/scrapy/scrapy.git \
+          git+https://github.com/scrapy/scrapyd.git \
+          git+https://github.com/my8100/logparser.git
+
+    - name: Launch Scrapyd (admin/12345 on 127.0.0.1:6800)
+      shell: bash
+      run: |
+        set -euo pipefail
+        printf '[scrapyd]\nusername = admin\npassword = 12345\n' > "$HOME/scrapyd.conf"
+        cat "$HOME/scrapyd.conf"
+        ( cd "$HOME" && nohup scrapyd > "$HOME/scrapyd.log" 2>&1 & )
+        up=
+        for _ in $(seq 1 30); do
+          # No -f: a 401 (auth required) still proves Scrapyd is listening.
+          if curl -s -o /dev/null "http://127.0.0.1:6800/"; then
+            up=1
+            break
+          fi
+          sleep 1
+        done
+        if [ -z "$up" ]; then
+          echo "Scrapyd failed to start within 30s:" >&2
+          cat "$HOME/scrapyd.log" >&2 || true
+          exit 1
+        fi
+        echo "Scrapyd is responding on 127.0.0.1:6800"
+
+    - name: Run tests
+      shell: bash
+      run: |
+        set -euo pipefail
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        coverage erase
+        coverage run --source=scrapydweb -m pytest -s -vv -l --disable-warnings --alluredir=allure-results tests
+
+    - name: Coverage report
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        echo "DATA_PATH=${DATA_PATH:-}"
+        echo "DATABASE_URL=${DATABASE_URL:-}"
+        coverage report || true
+        coverage xml || true
+        coverage html || true

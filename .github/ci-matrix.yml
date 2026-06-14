@@ -1,0 +1,37 @@
+# Single source of truth for the ScrapydWeb CI test matrix.
+#
+# Every combination the CI MUST exercise is listed here exactly once.
+# `.github/workflows/ci.yml` realizes the same combinations across its backend
+# jobs (sqlite / postgresql / mysql), and `scripts/check_ci_matrix.py` (run by
+# the `matrix-check` job) fails the build if the workflow and this file ever
+# drift apart -- so a key combination can never be silently dropped.
+#
+# To add or remove a combination: edit this list AND the matching job's
+# `strategy.matrix.include` in ci.yml. See .github/workflows/README.md.
+#
+# Fields:
+#   python    - Python version. Quote it so 3.10 is not parsed as the float 3.1.
+#   scrapyd   - pip  : latest Scrapy/Scrapyd from requirements-tests.txt
+#               v143 : scrapyd==1.4.3
+#               git  : scrapy + scrapyd + logparser installed from git HEAD
+#   database  - sqlite | postgresql | mysql
+#   data_path - true to exercise a custom DATA_PATH (sqlite only), else false
+
+required_combinations:
+  # backend: sqlite (no service container)
+  - {python: "3.8",  scrapyd: pip,  database: sqlite,     data_path: false}
+  - {python: "3.9",  scrapyd: pip,  database: sqlite,     data_path: false}
+  - {python: "3.9",  scrapyd: v143, database: sqlite,     data_path: false}
+  - {python: "3.10", scrapyd: pip,  database: sqlite,     data_path: true}
+  - {python: "3.11", scrapyd: pip,  database: sqlite,     data_path: false}
+  - {python: "3.12", scrapyd: pip,  database: sqlite,     data_path: false}
+  - {python: "3.12", scrapyd: v143, database: sqlite,     data_path: false}
+  - {python: "3.13", scrapyd: pip,  database: sqlite,     data_path: false}
+
+  # backend: postgresql (postgres service container)
+  - {python: "3.10", scrapyd: pip,  database: postgresql, data_path: false}
+  - {python: "3.10", scrapyd: git,  database: postgresql, data_path: false}
+
+  # backend: mysql (mysql service container)
+  - {python: "3.10", scrapyd: pip,  database: mysql,      data_path: false}
+  - {python: "3.10", scrapyd: git,  database: mysql,      data_path: false}

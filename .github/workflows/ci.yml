@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Guard: fail fast (and cheaply) if the matrix below ever stops covering
+  # exactly the combinations declared in .github/ci-matrix.yml.
+  matrix-check:
+    name: Validate CI matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - name: workflow matrix == .github/ci-matrix.yml
+        run: python scripts/check_ci_matrix.py
+
+  sqlite:
+    needs: matrix-check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {python: "3.8",  scrapyd: pip,  database: sqlite, data_path: false}
+          - {python: "3.9",  scrapyd: pip,  database: sqlite, data_path: false}
+          - {python: "3.9",  scrapyd: v143, database: sqlite, data_path: false}
+          - {python: "3.10", scrapyd: pip,  database: sqlite, data_path: true}
+          - {python: "3.11", scrapyd: pip,  database: sqlite, data_path: false}
+          - {python: "3.12", scrapyd: pip,  database: sqlite, data_path: false}
+          - {python: "3.12", scrapyd: v143, database: sqlite, data_path: false}
+          - {python: "3.13", scrapyd: pip,  database: sqlite, data_path: false}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/run-tests
+        with:
+          python-version: ${{ matrix.python }}
+          scrapyd: ${{ matrix.scrapyd }}
+          database: ${{ matrix.database }}
+          data-path: ${{ matrix.data_path }}
+      - uses: codecov/codecov-action@v4
+        if: ${{ always() }}
+        continue-on-error: true
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: results-sqlite-py${{ matrix.python }}-${{ matrix.scrapyd }}${{ matrix.data_path && '-datapath' || '' }}
+          path: |
+            allure-results
+            coverage.xml
+            htmlcov
+          if-no-files-found: ignore
+
+  postgresql:
+    needs: matrix-check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {python: "3.10", scrapyd: pip, database: postgresql, data_path: false}
+          - {python: "3.10", scrapyd: git, database: postgresql, data_path: false}
+    services:
+      postgres:
+        image: postgres:9.6
+        env:
+          POSTGRES_USER: circleci
+          POSTGRES_DB: circleci
+          POSTGRES_PASSWORD: passw0rd
+          # Mirrors the original CircleCI image: tests connect with a bogus password.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U circleci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/run-tests
+        with:
+          python-version: ${{ matrix.python }}
+          scrapyd: ${{ matrix.scrapyd }}
+          database: ${{ matrix.database }}
+          data-path: ${{ matrix.data_path }}
+      - uses: codecov/codecov-action@v4
+        if: ${{ always() }}
+        continue-on-error: true
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: results-postgresql-py${{ matrix.python }}-${{ matrix.scrapyd }}
+          path: |
+            allure-results
+            coverage.xml
+            htmlcov
+          if-no-files-found: ignore
+
+  mysql:
+    needs: matrix-check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {python: "3.10", scrapyd: pip, database: mysql, data_path: false}
+          - {python: "3.10", scrapyd: git, database: mysql, data_path: false}
+    services:
+      mysql:
+        image: mysql:5.7
+        env:
+          MYSQL_ROOT_PASSWORD: rootpw
+          MYSQL_DATABASE: test_db
+          MYSQL_USER: user
+          MYSQL_PASSWORD: passw0rd
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -prootpw"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/run-tests
+        with:
+          python-version: ${{ matrix.python }}
+          scrapyd: ${{ matrix.scrapyd }}
+          database: ${{ matrix.database }}
+          data-path: ${{ matrix.data_path }}
+      - uses: codecov/codecov-action@v4
+        if: ${{ always() }}
+        continue-on-error: true
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: results-mysql-py${{ matrix.python }}-${{ matrix.scrapyd }}
+          path: |
+            allure-results
+            coverage.xml
+            htmlcov
+          if-no-files-found: ignore

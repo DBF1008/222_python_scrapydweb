@@ -4,7 +4,7 @@
 
 [![PyPI - scrapydweb Version](https://img.shields.io/pypi/v/scrapydweb.svg)](https://pypi.org/project/scrapydweb/)
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/scrapydweb.svg)](https://pypi.org/project/scrapydweb/)
-[![CircleCI](https://circleci.com/gh/my8100/scrapydweb/tree/master.svg?style=shield)](https://circleci.com/gh/my8100/scrapydweb/tree/master)
+[![CI](https://github.com/my8100/scrapydweb/actions/workflows/ci.yml/badge.svg)](https://github.com/my8100/scrapydweb/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/my8100/scrapydweb/branch/master/graph/badge.svg)](https://codecov.io/gh/my8100/scrapydweb)
 [![Coverage Status](https://coveralls.io/repos/github/my8100/scrapydweb/badge.svg?branch=master)](https://coveralls.io/github/my8100/scrapydweb?branch=master)
 [![Downloads - total](https://static.pepy.tech/badge/scrapydweb)](https://pepy.tech/project/scrapydweb)
