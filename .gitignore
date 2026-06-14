@@ -45,3 +45,5 @@ build/
 *.egg-info/
 
 .idea
+
+.venv-release/

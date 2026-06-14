@@ -1,0 +1,427 @@
+# ScrapydWeb Release Pipeline
+# ============================
+#
+# Triggered by:
+#   1. Tag push (v*)        → validate → build → smoke-test → TestPyPI upload
+#   2. Manual dispatch       → self-contained validate + build + test → PyPI upload
+#
+# Required GitHub secrets:
+#   TEST_PYPI_API_TOKEN  — API token for TestPyPI uploads
+#   PYPI_API_TOKEN       — API token for PyPI uploads
+#
+# See RELEASE.md for the full release runbook.
+
+name: Release Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to promote (e.g. v1.7.0)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run — upload to TestPyPI instead of PyPI'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref || format('dispatch-{0}', inputs.tag) }}
+  cancel-in-progress: true
+
+# ---------------------------------------------------------------------------
+# Shared configuration
+# ---------------------------------------------------------------------------
+env:
+  PYTHON_VERSION: '3.10'
+
+jobs:
+
+  # =========================================================================
+  # Job 1: validate — fail fast on version inconsistency
+  # =========================================================================
+  validate:
+    name: Validate version consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'push'
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Extract version from tag
+        id: extract
+        run: |
+          TAG="${GITHUB_REF_NAME}"            # e.g. v1.7.0
+          VERSION="${TAG#v}"                   # strip leading v → 1.7.0
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Tag version: ${VERSION}"
+
+      - name: Check __version__.py
+        run: |
+          FILE_VERSION=$(python -c "exec(open('scrapydweb/__version__.py').read()); print(__version__)")
+          if [ "${FILE_VERSION}" != "${{ steps.extract.outputs.version }}" ]; then
+            echo "::error::Tag v${{ steps.extract.outputs.version }} does not match __version__.py (${FILE_VERSION})"
+            exit 1
+          fi
+          echo "✓ __version__.py matches: ${FILE_VERSION}"
+
+      - name: Check HISTORY.md
+        run: |
+          VERSION="${{ steps.extract.outputs.version }}"
+          # HISTORY.md uses RST headings: "1.7.0 (2025-02-16)" (no # prefix)
+          if ! grep -qE "^${VERSION//./\\.} \([0-9]{4}-[0-9]{2}-[0-9]{2}\)" HISTORY.md; then
+            echo "::error::HISTORY.md has no entry for version ${VERSION}"
+            exit 1
+          fi
+          echo "✓ HISTORY.md has entry for ${VERSION}"
+
+      - name: Check setup.py
+        run: |
+          SETUP_VERSION=$(python setup.py --version 2>/dev/null)
+          if [ "${SETUP_VERSION}" != "${{ steps.extract.outputs.version }}" ]; then
+            echo "::error::setup.py reports ${SETUP_VERSION} but tag is v${{ steps.extract.outputs.version }}"
+            exit 1
+          fi
+          echo "✓ setup.py matches: ${SETUP_VERSION}"
+
+  # =========================================================================
+  # Job 2: build — produce and validate artifacts
+  # =========================================================================
+  build:
+    name: Build & validate artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [validate]
+    if: github.event_name == 'push'
+    outputs:
+      version: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build twine
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Twine check
+        run: twine check dist/*
+
+      - name: Verify sdist contents
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          SDIST="dist/scrapydweb-${VERSION}.tar.gz"
+          tar tzf "$SDIST" > /tmp/sdist_contents.txt
+          echo "--- sdist contents (filtered) ---"
+          grep -E '(scrapydweb/|setup\.py|README|HISTORY|requirements|MANIFEST)' /tmp/sdist_contents.txt | head -30
+          REQUIRED_FILES=(
+            "scrapydweb/__version__.py"
+            "scrapydweb/__init__.py"
+            "scrapydweb/run.py"
+            "setup.py"
+            "README.md"
+            "HISTORY.md"
+            "requirements.txt"
+            "MANIFEST.in"
+          )
+          for f in "${REQUIRED_FILES[@]}"; do
+            if ! grep -q "$f" /tmp/sdist_contents.txt; then
+              echo "::error::sdist is missing required file: $f"
+              exit 1
+            fi
+          done
+          echo "✓ sdist contains all required files"
+
+      - name: Verify wheel contents
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          WHEEL="dist/scrapydweb-${VERSION}-py3-none-any.whl"
+          unzip -l "$WHEEL" > /tmp/wheel_contents.txt
+          echo "--- wheel contents (filtered) ---"
+          grep 'scrapydweb/' /tmp/wheel_contents.txt | head -30
+          REQUIRED_FILES=(
+            "scrapydweb/__version__.py"
+            "scrapydweb/__init__.py"
+            "scrapydweb/run.py"
+            "scrapydweb/default_settings.py"
+          )
+          for f in "${REQUIRED_FILES[@]}"; do
+            if ! grep -q "$f" /tmp/wheel_contents.txt; then
+              echo "::error::wheel is missing required file: $f"
+              exit 1
+            fi
+          done
+          echo "✓ wheel contains all required files"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+          retention-days: 30
+
+  # =========================================================================
+  # Job 3: smoke-test — install in isolated venvs and verify
+  # =========================================================================
+  smoke-test:
+    name: Smoke test (${{ matrix.install_method }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build]
+    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        install_method: [wheel, sdist]
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Create isolated venv
+        run: |
+          python -m venv /tmp/smoke-venv
+          /tmp/smoke-venv/bin/pip install --quiet --upgrade pip
+
+      - name: Install from ${{ matrix.install_method }}
+        run: |
+          VERSION="${{ needs.build.outputs.version }}"
+          if [ "${{ matrix.install_method }}" = "wheel" ]; then
+            /tmp/smoke-venv/bin/pip install "dist/scrapydweb-${VERSION}-py3-none-any.whl"
+          else
+            /tmp/smoke-venv/bin/pip install "dist/scrapydweb-${VERSION}.tar.gz"
+          fi
+
+      - name: Verify import and version
+        run: |
+          VERSION="${{ needs.build.outputs.version }}"
+          /tmp/smoke-venv/bin/python -c "
+          import scrapydweb
+          actual = scrapydweb.__version__
+          expected = '${VERSION}'
+          assert actual == expected, f'Version mismatch: {actual} != {expected}'
+          print(f'✓ import scrapydweb OK — version {actual}')
+          "
+
+      - name: Verify CLI entry point
+        run: |
+          /tmp/smoke-venv/bin/scrapydweb --help
+          echo "✓ scrapydweb --help OK"
+
+      - name: Verify dependency imports
+        run: |
+          /tmp/smoke-venv/bin/python -c "
+          from scrapydweb.utils import db
+          print('✓ scrapydweb.utils.db import OK')
+          "
+
+  # =========================================================================
+  # Job 4: publish-testpypi — auto-publish on tag push
+  # =========================================================================
+  publish-testpypi:
+    name: Publish to TestPyPI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [smoke-test, build]
+    if: github.event_name == 'push'
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/scrapydweb/${{ needs.build.outputs.version }}/
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install twine
+        run: python -m pip install --upgrade twine
+
+      - name: Upload to TestPyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        run: twine upload --repository testpypi dist/*
+
+      - name: Wait for TestPyPI index propagation
+        run: sleep 30
+
+      - name: Verify installation from TestPyPI
+        run: |
+          VERSION="${{ needs.build.outputs.version }}"
+          python -m venv /tmp/verify-venv
+          /tmp/verify-venv/bin/pip install --quiet --upgrade pip
+          /tmp/verify-venv/bin/pip install \
+            --index-url https://test.pypi.org/simple/ \
+            --extra-index-url https://pypi.org/simple/ \
+            "scrapydweb==${VERSION}"
+          /tmp/verify-venv/bin/python -c "
+          import scrapydweb
+          actual = scrapydweb.__version__
+          expected = '${VERSION}'
+          assert actual == expected, f'TestPyPI version mismatch: {actual} != {expected}'
+          print(f'✓ TestPyPI install verified — version {actual}')
+          "
+          rm -rf /tmp/verify-venv
+
+  # =========================================================================
+  # Job 5: publish-pypi — manual promotion via workflow_dispatch
+  # =========================================================================
+  publish-pypi:
+    name: Publish to PyPI${{ inputs.dry_run && ' (dry run → TestPyPI)' || '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name == 'workflow_dispatch'
+    environment:
+      name: ${{ inputs.dry_run && 'testpypi' || 'pypi' }}
+      url: ${{ inputs.dry_run && format('https://test.pypi.org/project/scrapydweb/{0}/', steps.extract.outputs.version) || format('https://pypi.org/project/scrapydweb/{0}/', steps.extract.outputs.version) }}
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # --- Inline validate (self-contained — no dependency on prior run) ---
+
+      - name: Extract version from tag
+        id: extract
+        run: |
+          TAG="${{ inputs.tag }}"
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Promoting tag ${TAG} → version ${VERSION}"
+
+      - name: Validate version consistency
+        run: |
+          VERSION="${{ steps.extract.outputs.version }}"
+
+          # Check __version__.py
+          FILE_VERSION=$(python -c "exec(open('scrapydweb/__version__.py').read()); print(__version__)")
+          if [ "${FILE_VERSION}" != "${VERSION}" ]; then
+            echo "::error::Tag v${VERSION} does not match __version__.py (${FILE_VERSION})"
+            exit 1
+          fi
+          echo "✓ __version__.py matches: ${FILE_VERSION}"
+
+          # Check HISTORY.md
+          if ! grep -qE "^${VERSION//./\\.} \([0-9]{4}-[0-9]{2}-[0-9]{2}\)" HISTORY.md; then
+            echo "::error::HISTORY.md has no entry for version ${VERSION}"
+            exit 1
+          fi
+          echo "✓ HISTORY.md has entry for ${VERSION}"
+
+          # Check setup.py
+          SETUP_VERSION=$(python setup.py --version 2>/dev/null)
+          if [ "${SETUP_VERSION}" != "${VERSION}" ]; then
+            echo "::error::setup.py reports ${SETUP_VERSION} but tag is v${VERSION}"
+            exit 1
+          fi
+          echo "✓ setup.py matches: ${SETUP_VERSION}"
+
+      # --- Build ---
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build twine
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Twine check
+        run: twine check dist/*
+
+      # --- Inline smoke test (abbreviated) ---
+
+      - name: Smoke test (wheel install)
+        run: |
+          VERSION="${{ steps.extract.outputs.version }}"
+          python -m venv /tmp/smoke-venv
+          /tmp/smoke-venv/bin/pip install --quiet --upgrade pip
+          /tmp/smoke-venv/bin/pip install --quiet "dist/scrapydweb-${VERSION}-py3-none-any.whl"
+          /tmp/smoke-venv/bin/python -c "
+          import scrapydweb
+          actual = scrapydweb.__version__
+          expected = '${VERSION}'
+          assert actual == expected, f'Version mismatch: {actual} != {expected}'
+          print(f'✓ Smoke test OK — version {actual}')
+          "
+          /tmp/smoke-venv/bin/scrapydweb --help > /dev/null
+          echo "✓ CLI entry point OK"
+          rm -rf /tmp/smoke-venv
+
+      # --- Publish ---
+
+      - name: Upload to TestPyPI (dry run)
+        if: inputs.dry_run
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        run: twine upload --repository testpypi dist/*
+
+      - name: Upload to PyPI
+        if: '!inputs.dry_run'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: twine upload dist/*
+
+      # --- Post-upload verification ---
+
+      - name: Wait for index propagation
+        run: sleep 30
+
+      - name: Verify installation from ${{ inputs.dry_run && 'TestPyPI' || 'PyPI' }}
+        run: |
+          VERSION="${{ steps.extract.outputs.version }}"
+          python -m venv /tmp/verify-venv
+          /tmp/verify-venv/bin/pip install --quiet --upgrade pip
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            /tmp/verify-venv/bin/pip install \
+              --index-url https://test.pypi.org/simple/ \
+              --extra-index-url https://pypi.org/simple/ \
+              "scrapydweb==${VERSION}"
+          else
+            /tmp/verify-venv/bin/pip install "scrapydweb==${VERSION}"
+          fi
+          /tmp/verify-venv/bin/python -c "
+          import scrapydweb
+          actual = scrapydweb.__version__
+          expected = '${VERSION}'
+          assert actual == expected, f'Post-upload version mismatch: {actual} != {expected}'
+          print(f'✓ Post-upload verification OK — version {actual}')
+          "
+          rm -rf /tmp/verify-venv
